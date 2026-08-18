@@ -205,6 +205,49 @@ test("tool calls without a preceding commentary still get a declaring assistant"
   assert.equal(wire[toolIdx - 1].toolCalls[0].id, "call_00_nocommentary");
 });
 
+test("declared calls with no stored output get a synthesized interrupted result", () => {
+  // synthetic: a call is emitted but the turn is aborted before any output
+  const rollout = [
+    { timestamp: "2026-08-01T00:00:00.000Z", type: "session_meta", payload: { cwd: "/mnt/e/cell" } },
+    { timestamp: "2026-08-01T00:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "t1" } },
+    { timestamp: "2026-08-01T00:00:02.000Z", type: "event_msg", payload: { type: "user_message", message: "go" } },
+    {
+      timestamp: "2026-08-01T00:00:03.000Z",
+      type: "event_msg",
+      payload: { type: "agent_message", message: "running it", phase: "commentary" },
+    },
+    {
+      timestamp: "2026-08-01T00:00:04.000Z",
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "exec_command",
+        arguments: "{\"cmd\":\"long-task\"}",
+        call_id: "call_00_aborted",
+        internal_chat_message_metadata_passthrough: { turn_id: "t1" },
+      },
+    },
+    { timestamp: "2026-08-01T00:00:05.000Z", type: "event_msg", payload: { type: "turn_aborted", turn_id: "t1" } },
+  ].map((l) => JSON.stringify(l)).join("\n");
+
+  const { turns } = parseRollout(rollout);
+  const { events } = buildSession(turns, { sessionId: "session-abort", cwd: "/mnt/e/cell" });
+
+  // every declared call is answered (synthesized interrupted result)
+  const wire = wireMessages(events);
+  const declared = wire
+    .filter((m) => m.role === "assistant")
+    .flatMap((m) => m.toolCalls.map((c) => c.id));
+  const toolIds = wire.filter((m) => m.role === "tool").map((m) => m.tool_call_id);
+  assert.deepEqual([...new Set(toolIds)], [...new Set(declared)]);
+
+  // the synthesized result carries the interrupted flag/message
+  const synth = events.find((e) => e.type === "tool/result" && e.data.message.content[0].isError === true);
+  assert.ok(synth, "expected a synthesized interrupted tool/result");
+  assert.ok(synth.data.message.content[0].content[0].text.includes("interrupted"));
+  assert.equal(synth.data.error.code, "TOOL_OUTCOME_UNKNOWN");
+});
+
 test("deriveTitle strips a leading URL glued to CJK text", () => {
   assert.equal(
     deriveTitle("https://www.kaggle.com/competitions/foo/overview我现在要打这个比赛，帮我规划一下任务"),
