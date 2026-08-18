@@ -280,6 +280,15 @@ test("buildSession maxTurns keeps only the newest turns but the original title",
   const titleOf = (s) => s.events.find((e) => e.type === "session/title").data.title;
   assert.equal(titleOf(full), titleOf(tail));
 
+  // an explicit title override wins over derivation
+  const named = buildSession(turns, {
+    sessionId: "session-named",
+    cwd: "/mnt/e/cell",
+    maxTurns: 1,
+    title: "cell 比赛（最近80轮·可继续）",
+  });
+  assert.equal(titleOf(named), "cell 比赛（最近80轮·可继续）");
+
   // the tail remains wire-valid
   const wire = wireMessages(tail.events);
   const declared = wire

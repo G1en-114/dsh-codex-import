@@ -34,17 +34,20 @@ Options:
   --max-turns <n>     keep only the newest N turns (older work is dropped so
                       a huge codex session fits the model context window;
                       title/createdAt still come from the full conversation)
+  --title <text>      override the session title (e.g. mark a truncated
+                      continuation apart from the full browse-only import)
   --root <dir>        sessions root (default: ~/.dsh/sessions)
   --dry-run           parse and build, but do not write
   -h, --help          show this help`;
 
 /** Parse argv into an options object. */
 function parseArgv(argv) {
-  const out = { target: null, sessionId: null, cwd: null, maxTurns: null, root: null, dryRun: false };
+  const out = { target: null, sessionId: null, cwd: null, maxTurns: null, title: null, root: null, dryRun: false };
   for (let i = 0; i < argv.length; i++) {
     const tok = argv[i];
     if (tok === "--session-id") out.sessionId = argv[++i] ?? null;
     else if (tok === "--cwd") out.cwd = argv[++i] ?? null;
+    else if (tok === "--title") out.title = argv[++i] ?? null;
     else if (tok === "--max-turns") {
       const raw = argv[++i];
       const n = Number(raw);
@@ -139,6 +142,7 @@ async function main() {
     cwd,
     createdAt: turns[0].startTs,
     maxTurns: opts.maxTurns ?? undefined,
+    title: opts.title ?? undefined,
   });
   const title = events.findLast((e) => e.type === "session/title")?.data?.title ?? "";
 
