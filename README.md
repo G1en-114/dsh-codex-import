@@ -112,6 +112,7 @@ codex rollout 是两类事件流的 JSONL：`event_msg`（UI 层消息与 turn �
 npm test                                    # 单元测试（纯 Node，无依赖）
 node bin/dsh-codex-import.mjs --dry-run <session-id>   # 用真实 rollout 试跑
 node scripts/live.mjs /tmp/test-sessions <session-id>  # 在真实 CommandRuntime 里跑 /codex-import（需 @deepseek-ai 依赖）
+node scripts/wire-verify.mjs <sessions-root> <session-id>  # 用真实 foldSurface + 序列化规则校验会话 LLM 历史（需 @deepseek-ai 依赖）
 ```
 
 ### 仓库结构 / layout
