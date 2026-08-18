@@ -31,18 +31,26 @@ Options:
   --session-id <id>   session id to use (default: session-<uuid>)
   --cwd <dir>         workspace cwd for the imported session (default: the
                       rollout's own session_meta cwd)
+  --max-turns <n>     keep only the newest N turns (older work is dropped so
+                      a huge codex session fits the model context window;
+                      title/createdAt still come from the full conversation)
   --root <dir>        sessions root (default: ~/.dsh/sessions)
   --dry-run           parse and build, but do not write
   -h, --help          show this help`;
 
 /** Parse argv into an options object. */
 function parseArgv(argv) {
-  const out = { target: null, sessionId: null, cwd: null, root: null, dryRun: false };
+  const out = { target: null, sessionId: null, cwd: null, maxTurns: null, root: null, dryRun: false };
   for (let i = 0; i < argv.length; i++) {
     const tok = argv[i];
     if (tok === "--session-id") out.sessionId = argv[++i] ?? null;
     else if (tok === "--cwd") out.cwd = argv[++i] ?? null;
-    else if (tok === "--root") out.root = argv[++i] ?? null;
+    else if (tok === "--max-turns") {
+      const raw = argv[++i];
+      const n = Number(raw);
+      if (!Number.isSafeInteger(n) || n <= 0) throw new Error("--max-turns must be a positive integer");
+      out.maxTurns = n;
+    } else if (tok === "--root") out.root = argv[++i] ?? null;
     else if (tok === "--dry-run") out.dryRun = true;
     else if (tok === "-h" || tok === "--help") out.help = true;
     else if (tok.startsWith("--")) throw new Error(`unknown option: ${tok}`);
@@ -125,15 +133,17 @@ async function main() {
   }
 
   const sessionId = opts.sessionId ?? `session-${randomUUID()}`;
+  const keptTurns = opts.maxTurns === null ? turns.length : Math.min(opts.maxTurns, turns.length);
   const { header, events } = buildSession(turns, {
     sessionId,
     cwd,
     createdAt: turns[0].startTs,
+    maxTurns: opts.maxTurns ?? undefined,
   });
   const title = events.findLast((e) => e.type === "session/title")?.data?.title ?? "";
 
   console.log(`rollout:   ${rolloutPath}`);
-  console.log(`turns:     ${turns.length}`);
+  console.log(`turns:     ${keptTurns}${keptTurns < turns.length ? ` (dropped the oldest ${turns.length - keptTurns})` : ""}`);
   console.log(`events:    ${events.length}`);
   console.log(`session:   ${sessionId}`);
   console.log(`cwd:       ${cwd}`);

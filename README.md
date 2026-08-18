@@ -58,9 +58,12 @@ dsh-codex-import <codex-session-id | rollout.jsonl> [options]
 ```
 /codex-import 019feec0-f565-7900-b985-1d6ba3b63a56
 /codex-import ~/rollout.jsonl --session-id session-my-import --cwd /mnt/e/cell
+/codex-import 019feec0-... --max-turns 80
 ```
 
 导入完成后会返回新的 session id，刷新侧边栏即可看到（标题会在首次打开会话后固化到投影缓存）。
+
+> **超大会话**：codex 长会话的 rollout 保留的是完整未压缩历史，全量导入可能超过模型的上下文窗口（如 100 万 token）。用 `--max-turns <n>` 只保留最近的 n 个 turn（更早的内容被丢弃，标题与创建时间仍来自完整对话），或稍后在会话里运行 `/compact`。
 
 ### CLI
 
@@ -70,6 +73,7 @@ dsh-codex-import <codex-session-id | rollout.jsonl> [options]
 Options:
   --session-id <id>   指定导入后的会话 id（默认自动生成 session-<uuid>）
   --cwd <dir>         会话所属 workspace（默认取 codex 会话自己的 cwd）
+  --max-turns <n>     只保留最近的 n 个 turn（丢弃更早内容；标题/创建时间不变）
   --root <dir>        DSH 会话根目录（默认 ~/.dsh/sessions）
   --dry-run           只解析、构建、打印摘要，不写入
   -h, --help          帮助
@@ -81,6 +85,7 @@ Options:
 dsh-codex-import 019feec0-f565-7900-b985-1d6ba3b63a56                    # 导入到 ~/.dsh/sessions
 dsh-codex-import --root /tmp/test-sessions 019feec0-...                  # 写入自定义根目录
 dsh-codex-import --dry-run 019feec0-...                                  # 试跑
+dsh-codex-import --max-turns 80 019feec0-...                             # 只导入最近 80 个 turn
 dsh-codex-import ~/backup/rollout-2026-08-11.jsonl --cwd /mnt/e/cell     # 直接给 rollout 文件
 ```
 
@@ -101,6 +106,8 @@ codex rollout 是两类事件流的 JSONL：`event_msg`（UI 层消息与 turn �
 | 首条用户消息 | `session/title`（fallback 标题，自动剥离 URL） |
 
 - `web_search_call` 因 codex 不落盘搜索结果而省略；工具调用保留 codex 原生名称与参数。
+- 工具调用同时以两种形式出现：独立 `tool/call` 事件（供 UI 轨迹与不变式检查），以及挂到最近一条 assistant 消息上的 `tool-call` 内容块（供 LLM 历史——DSH 的模型可见历史只由 `user/message`/`assistant/message`/`tool/result` 派生，工具调用必须由 assistant 消息声明）。
+- 被中断、没有落盘输出的调用（turn 被 abort）会在 step 结束前补一条合成的中断 `tool/result`（`isError: true`，文案与 DSH 自身的 `interruptedTurnClosers` 一致），保证每个声明的 `tool_calls` id 都有应答。
 - 写入的 `session.jsonl.zstd` 与 DSH 持久化层完全一致：**第一帧只有 header 行**，第二帧为全部事件行，`seq` 从 0 连续递增，压缩带 checksum。CLI 写入后自校验（字节级比对 + seq 检查）。
 - 产物已用 DSH 真实读取器 `JsonlSessionPersistence.loadStored` 验证通过（无 torn marker）。
 

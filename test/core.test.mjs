@@ -258,8 +258,33 @@ test("deriveTitle strips a leading URL glued to CJK text", () => {
 
 test("tokenize/parseArgs handle flags and quoted values", () => {
   assert.deepEqual(tokenize(`019feec0 "a b" --cwd /mnt/e/cell`), ["019feec0", "a b", "--cwd", "/mnt/e/cell"]);
-  const parsed = parseArgs(`019feec0-f565 --session-id session-x --cwd "/mnt/e/cell"`);
+  const parsed = parseArgs(`019feec0-f565 --session-id session-x --cwd "/mnt/e/cell" --max-turns 40`);
   assert.equal(parsed.target, "019feec0-f565");
   assert.equal(parsed.sessionId, "session-x");
   assert.equal(parsed.cwd, "/mnt/e/cell");
+  assert.equal(parsed.maxTurns, 40);
+  assert.throws(() => parseArgs(`019feec0 --max-turns abc`), /positive integer/);
+});
+
+test("buildSession maxTurns keeps only the newest turns but the original title", () => {
+  const { turns } = parseRollout(fixture);
+  const full = buildSession(turns, { sessionId: "session-full", cwd: "/mnt/e/cell" });
+  const tail = buildSession(turns, { sessionId: "session-tail", cwd: "/mnt/e/cell", maxTurns: 1 });
+
+  const fullTurns = full.events.filter((e) => e.type === "turn/start").length;
+  const tailTurns = tail.events.filter((e) => e.type === "turn/start").length;
+  assert.equal(fullTurns, turns.length);
+  assert.equal(tailTurns, 1);
+
+  // title comes from the FULL conversation, not the first retained turn
+  const titleOf = (s) => s.events.find((e) => e.type === "session/title").data.title;
+  assert.equal(titleOf(full), titleOf(tail));
+
+  // the tail remains wire-valid
+  const wire = wireMessages(tail.events);
+  const declared = wire
+    .filter((m) => m.role === "assistant")
+    .flatMap((m) => m.toolCalls.map((c) => c.id));
+  const toolIds = wire.filter((m) => m.role === "tool").map((m) => m.tool_call_id);
+  assert.deepEqual([...new Set(toolIds)], [...new Set(declared)]);
 });
