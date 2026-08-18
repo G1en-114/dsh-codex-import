@@ -1,0 +1,56 @@
+{
+  "name": "dsh-codex-import",
+  "version": "0.1.0",
+  "description": "Import codex CLI conversations into DeepSeek Harness as sessions — /codex-import command + standalone CLI. · 把 codex CLI 的对话历史导入 DeepSeek Harness，成为可浏览的会话。",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./core": {
+      "types": "./lib/types/core.d.ts",
+      "default": "./lib/core.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dsh-codex-import": "./bin/dsh-codex-import.mjs"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-commands": "*",
+    "@deepseek-ai/dsh-session-persistence": "*"
+  },
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "codex",
+    "openai-codex",
+    "migration",
+    "import",
+    "sessions"
+  ]
+}
