@@ -101,6 +101,110 @@ test("serialize/verify round-trips the two-frame zstd layout", () => {
   assert.equal(check.header.cwd, "/mnt/e/cell");
 });
 
+/**
+ * Replicate the DSH model-visible surface fold (deriveEventMessage over
+ * surfaceOp append nodes) plus the DeepSeek chat-completions serializer:
+ * assistant tool-call blocks become `tool_calls`, tool-result blocks become
+ * standalone `tool` messages. Returns the wire message list.
+ */
+function wireMessages(events) {
+  const wire = [];
+  for (const e of events) {
+    if (e.surfaceOp !== "append") continue;
+    if (e.type === "user/message") {
+      wire.push({ role: "user", content: e.data.content });
+    } else if (e.type === "assistant/message") {
+      const msg = e.data.message;
+      if (msg.content.length === 0) continue;
+      const toolCalls = msg.content
+        .filter((b) => b.type === "tool-call")
+        .map((b) => ({ id: b.id, name: b.name, arguments: b.arguments }));
+      wire.push({ role: "assistant", content: msg.content, toolCalls });
+    } else if (e.type === "tool/result") {
+      for (const block of e.data.message.content) {
+        if (block.type === "tool-result") {
+          wire.push({ role: "tool", tool_call_id: block.toolCallId });
+        }
+      }
+    }
+  }
+  return wire;
+}
+
+test("every tool message is preceded by an assistant declaring its call id", () => {
+  const { turns } = parseRollout(fixture);
+  const { events } = buildSession(turns, {
+    sessionId: "session-wire",
+    cwd: "/mnt/e/cell",
+    createdAt: turns[0].startTs,
+  });
+
+  const wire = wireMessages(events);
+  const toolMessages = wire.filter((m) => m.role === "tool");
+  const declared = wire
+    .filter((m) => m.role === "assistant")
+    .flatMap((m) => m.toolCalls.map((c) => c.id));
+
+  // every assistant tool-call block resolves to a tool result and vice versa
+  assert.equal(declared.length, toolMessages.length);
+
+  // OpenAI/DeepSeek rule: each tool message's id must be declared by the most
+  // recent preceding assistant (a run of tool messages after one assistant
+  // with multiple tool_calls is the canonical valid shape).
+  for (let i = 0; i < wire.length; i++) {
+    if (wire[i].role !== "tool") continue;
+    let j = i - 1;
+    while (j >= 0 && wire[j].role === "tool") j--;
+    const prev = wire[j];
+    assert.ok(prev, `tool message at ${i} has no preceding assistant`);
+    assert.equal(prev.role, "assistant", `tool message at ${i} not preceded by assistant`);
+    assert.ok(
+      prev.toolCalls.some((c) => c.id === wire[i].tool_call_id),
+      `tool message ${wire[i].tool_call_id} not declared by preceding assistant`,
+    );
+  }
+});
+
+test("tool calls without a preceding commentary still get a declaring assistant", () => {
+  // synthetic: a user message followed directly by a tool call (no commentary)
+  const rollout = [
+    { timestamp: "2026-08-01T00:00:00.000Z", type: "session_meta", payload: { cwd: "/mnt/e/cell" } },
+    { timestamp: "2026-08-01T00:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "t1" } },
+    { timestamp: "2026-08-01T00:00:02.000Z", type: "event_msg", payload: { type: "user_message", message: "run it" } },
+    {
+      timestamp: "2026-08-01T00:00:03.000Z",
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "exec_command",
+        arguments: "{\"cmd\":\"pwd\"}",
+        call_id: "call_00_nocommentary",
+        internal_chat_message_metadata_passthrough: { turn_id: "t1" },
+      },
+    },
+    {
+      timestamp: "2026-08-01T00:00:04.000Z",
+      type: "response_item",
+      payload: {
+        type: "function_call_output",
+        call_id: "call_00_nocommentary",
+        output: "Process exited with code 0\n/mnt/e/cell\n",
+        internal_chat_message_metadata_passthrough: { turn_id: "t1" },
+      },
+    },
+    { timestamp: "2026-08-01T00:00:05.000Z", type: "event_msg", payload: { type: "task_complete", turn_id: "t1" } },
+  ].map((l) => JSON.stringify(l)).join("\n");
+
+  const { turns } = parseRollout(rollout);
+  const { events } = buildSession(turns, { sessionId: "session-synth", cwd: "/mnt/e/cell" });
+
+  const wire = wireMessages(events);
+  const toolIdx = wire.findIndex((m) => m.role === "tool");
+  assert.ok(toolIdx > 0);
+  assert.equal(wire[toolIdx - 1].role, "assistant");
+  assert.equal(wire[toolIdx - 1].toolCalls[0].id, "call_00_nocommentary");
+});
+
 test("deriveTitle strips a leading URL glued to CJK text", () => {
   assert.equal(
     deriveTitle("https://www.kaggle.com/competitions/foo/overview我现在要打这个比赛，帮我规划一下任务"),
