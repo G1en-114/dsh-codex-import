@@ -21,7 +21,16 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { constants, zstdCompressSync, zstdDecompressSync } from "node:zlib";
 import { randomUUID } from "node:crypto";
-import { buildSession, projectKey, parseRollout } from "../lib/core.js";
+import {
+  COMPACTION_INSTRUCTION,
+  buildSession,
+  estimateSessionTokens,
+  parseRollout,
+  projectKey,
+  selectKeepCount,
+  serializeWire,
+  surfaceMessages,
+} from "../lib/core.js";
 import { resolveRolloutPath } from "../lib/index.js";
 
 const USAGE = `Usage:
@@ -36,30 +45,115 @@ Options:
                       title/createdAt still come from the full conversation)
   --title <text>      override the session title (e.g. mark a truncated
                       continuation apart from the full browse-only import)
+  --compact           auto-compact oversized histories: summarize the oldest
+                      turns via the provider and land a <compacted-summary>
+                      checkpoint before the newest turns. Requires the API
+                      key: DEEPSEEK_API_KEY env, or ~/.dsh/.credentials.yaml.
+  --model <id>        summarizer model (default: deepseek-v4-flash)
+  --context-window <n>  model context window for the budget (default 1000000)
+  --max-tokens <n>    completion budget for the budget (default 256000)
   --root <dir>        sessions root (default: ~/.dsh/sessions)
   --dry-run           parse and build, but do not write
   -h, --help          show this help`;
 
 /** Parse argv into an options object. */
 function parseArgv(argv) {
-  const out = { target: null, sessionId: null, cwd: null, maxTurns: null, title: null, root: null, dryRun: false };
+  const out = {
+    target: null,
+    sessionId: null,
+    cwd: null,
+    maxTurns: null,
+    title: null,
+    compact: false,
+    model: null,
+    contextWindow: null,
+    maxTokens: null,
+    root: null,
+    dryRun: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     const tok = argv[i];
     if (tok === "--session-id") out.sessionId = argv[++i] ?? null;
     else if (tok === "--cwd") out.cwd = argv[++i] ?? null;
     else if (tok === "--title") out.title = argv[++i] ?? null;
-    else if (tok === "--max-turns") {
+    else if (tok === "--model") out.model = argv[++i] ?? null;
+    else if (tok === "--context-window") {
+      const n = Number(argv[++i]);
+      if (!Number.isSafeInteger(n) || n <= 0) throw new Error("--context-window must be a positive integer");
+      out.contextWindow = n;
+    } else if (tok === "--max-tokens") {
+      const n = Number(argv[++i]);
+      if (!Number.isSafeInteger(n) || n <= 0) throw new Error("--max-tokens must be a positive integer");
+      out.maxTokens = n;
+    } else if (tok === "--max-turns") {
       const raw = argv[++i];
       const n = Number(raw);
       if (!Number.isSafeInteger(n) || n <= 0) throw new Error("--max-turns must be a positive integer");
       out.maxTurns = n;
-    } else if (tok === "--root") out.root = argv[++i] ?? null;
+    } else if (tok === "--compact") out.compact = true;
+    else if (tok === "--root") out.root = argv[++i] ?? null;
     else if (tok === "--dry-run") out.dryRun = true;
     else if (tok === "-h" || tok === "--help") out.help = true;
     else if (tok.startsWith("--")) throw new Error(`unknown option: ${tok}`);
     else if (out.target === null) out.target = tok;
   }
   return out;
+}
+
+/**
+ * Summarize a span of wire messages with an OpenAI-compatible chat
+ * completions call. The API key comes from DEEPSEEK_API_KEY or the DSH
+ * credentials file (~/.dsh/.credentials.yaml).
+ * @param {Array<object>} messages - derived messages of the dropped span.
+ * @param {{ model: string }} options
+ * @returns {Promise<Array<{type:"text",text:string}>>}
+ */
+async function summarizeWithProvider(messages, { model }) {
+  const key =
+    process.env.DEEPSEEK_API_KEY ??
+    (await readCredentialsKey(join(homedir(), ".dsh", ".credentials.yaml")));
+  if (!key) {
+    throw new Error("no API key: export DEEPSEEK_API_KEY or store it in ~/.dsh/.credentials.yaml");
+  }
+  const baseURL = process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com";
+  const wire = serializeWire(messages);
+  const response = await fetch(`${baseURL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      messages: [...wire, { role: "user", content: COMPACTION_INSTRUCTION }],
+      max_tokens: 8192,
+      stream: false,
+    }),
+  });
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 300);
+    throw new Error(`summarizer HTTP ${response.status}: ${detail}`);
+  }
+  const data = await response.json();
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content !== "string" || content.trim() === "") {
+    throw new Error("summarizer returned empty content");
+  }
+  return [{ type: "text", text: content }];
+}
+
+/** Read `KEY: value` pairs from the DSH credentials YAML (simple parser). */
+async function readCredentialsKey(path) {
+  try {
+    const text = await readFile(path, "utf8");
+    for (const line of text.split(/\r?\n/)) {
+      const match = /^([A-Za-z0-9_]+)\s*:\s*(.+?)\s*$/.exec(line);
+      if (match && match[1] === "DEEPSEEK_API_KEY") return match[2].replace(/^["']|["']$/gu, "");
+    }
+  } catch {
+    // missing file is fine — fall through to null
+  }
+  return null;
 }
 
 /** Serialize header + events as two Zstandard frames, matching dsh persistence. */
@@ -136,13 +230,56 @@ async function main() {
   }
 
   const sessionId = opts.sessionId ?? `session-${randomUUID()}`;
+  const createdAt = turns[0].startTs;
+
+  // --compact: when the full history would exceed the context budget,
+  // summarize the oldest turns with the provider and land a checkpoint.
+  let summary = null;
+  let compactInfo = null;
+  if (opts.compact && opts.maxTurns === null) {
+    const full = buildSession(turns, { sessionId, cwd, createdAt, title: opts.title ?? undefined });
+    const budget = (opts.contextWindow ?? 1000000) - (opts.maxTokens ?? 256000) - 30000;
+    const estimate = estimateSessionTokens(full.events);
+    if (estimate > budget) {
+      const { keep } = selectKeepCount(full.events, Math.floor(budget * 0.6));
+      const dropped = turns.length - keep;
+      compactInfo = { kept: keep, dropped, fallback: true };
+      if (opts.dryRun) {
+        console.log(
+          `compact:   history ~${estimate.toLocaleString()} tokens > budget ${budget.toLocaleString()} — ` +
+            `would summarize the oldest ${dropped} turns into a checkpoint and keep the newest ${keep} verbatim ` +
+            `(dry-run: summarizer call skipped)`,
+        );
+      } else {
+        const droppedEvents = buildSession(turns, { sessionId, cwd, createdAt, maxTurns: dropped });
+        try {
+          summary = await summarizeWithProvider(surfaceMessages(droppedEvents.events), {
+            model: opts.model ?? "deepseek-v4-flash",
+          });
+          compactInfo.fallback = false;
+          console.log(
+            `compact:   history ~${estimate.toLocaleString()} tokens > budget ${budget.toLocaleString()} — ` +
+              `summarized the oldest ${dropped} turns into a checkpoint, keeping the newest ${keep} verbatim`,
+          );
+        } catch (error) {
+          console.warn(
+            `compact:   summarization failed (${error instanceof Error ? error.message : String(error)}); importing the newest ${keep} turns verbatim`,
+          );
+        }
+      }
+    } else {
+      console.log(`compact:   history ~${estimate.toLocaleString()} tokens fits the budget (${budget.toLocaleString()}) — no compaction needed`);
+    }
+  }
+
   const keptTurns = opts.maxTurns === null ? turns.length : Math.min(opts.maxTurns, turns.length);
   const { header, events } = buildSession(turns, {
     sessionId,
     cwd,
-    createdAt: turns[0].startTs,
-    maxTurns: opts.maxTurns ?? undefined,
+    createdAt,
+    maxTurns: opts.maxTurns ?? (compactInfo ? compactInfo.kept : undefined),
     title: opts.title ?? undefined,
+    summary,
   });
   const title = events.findLast((e) => e.type === "session/title")?.data?.title ?? "";
 

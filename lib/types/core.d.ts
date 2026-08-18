@@ -38,5 +38,26 @@ export function parseRollout(text: string): Rollout;
 export function deriveTitle(firstPrompt: string): string;
 export function buildSession(
   turns: Turn[],
-  options: { sessionId: string; cwd: string; createdAt?: number },
+  options: {
+    sessionId: string;
+    cwd: string;
+    createdAt?: number;
+    maxTurns?: number;
+    title?: string;
+    summary?: Array<{ type: "text"; text: string }>;
+    compactionId?: string;
+  },
 ): BuiltSession;
+export const SUMMARY_OPEN_TAG: string;
+export const SUMMARY_CLOSE_TAG: string;
+export const CHECKPOINT_PREAMBLE: string;
+export const COMPACTION_INSTRUCTION: string;
+export function estimateTokens(text: string): number;
+export function estimateMessageTokens(message: { content?: Array<Record<string, unknown>> }): number;
+export function surfaceMessages(events: Array<Record<string, unknown>>): Array<Record<string, unknown>>;
+export function estimateSessionTokens(events: Array<Record<string, unknown>>): number;
+export function selectKeepCount(
+  events: Array<Record<string, unknown>>,
+  budgetTokens: number,
+): { keep: number; estimate: number };
+export function serializeWire(messages: Array<Record<string, unknown>>): Array<Record<string, unknown>>;

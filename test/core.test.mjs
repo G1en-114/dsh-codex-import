@@ -3,7 +3,21 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { buildSession, deriveTitle, parseRollout, projectKey } from "../lib/core.js";
+import {
+  CHECKPOINT_PREAMBLE,
+  SUMMARY_CLOSE_TAG,
+  SUMMARY_OPEN_TAG,
+  buildSession,
+  deriveTitle,
+  estimateMessageTokens,
+  estimateSessionTokens,
+  estimateTokens,
+  parseRollout,
+  projectKey,
+  selectKeepCount,
+  serializeWire,
+  surfaceMessages,
+} from "../lib/core.js";
 import { parseArgs, tokenize } from "../lib/index.js";
 import { serializeSession, verifySession } from "../bin/dsh-codex-import.mjs";
 
@@ -296,4 +310,103 @@ test("buildSession maxTurns keeps only the newest turns but the original title",
     .flatMap((m) => m.toolCalls.map((c) => c.id));
   const toolIds = wire.filter((m) => m.role === "tool").map((m) => m.tool_call_id);
   assert.deepEqual([...new Set(toolIds)], [...new Set(declared)]);
+});
+
+test("estimateTokens prices Han characters ~1 token and is conservative", () => {
+  assert.ok(estimateTokens("你好世界") >= 4, "CJK chars price at least 1 token each");
+  assert.ok(estimateTokens("a".repeat(100)) >= 50, "ASCII prices >= 1 token per 2 chars");
+  // CJK of the same length prices higher than ASCII
+  assert.ok(estimateTokens("你好你好你好你好") > estimateTokens("abcdabcd"));
+  assert.equal(estimateTokens(""), 0);
+});
+
+test("surfaceMessages folds exactly the model-visible events", () => {
+  const { turns } = parseRollout(fixture);
+  const { events } = buildSession(turns, { sessionId: "session-s", cwd: "/mnt/e/cell" });
+  const surface = surfaceMessages(events);
+  assert.ok(surface.length >= 3, "expected user, assistant, and tool-result messages on the surface");
+  assert.ok(surface.some((m) => m.role === "user"), "has a user message");
+  assert.ok(
+    surface.some((m) => m.role === "assistant" && m.content.some((b) => b.type === "tool-call")),
+    "assistant messages carry tool-call blocks",
+  );
+  assert.ok(
+    surface.some((m) => m.role === "user" && m.content.some((b) => b.type === "tool-result")),
+    "tool results are user messages with tool-result blocks",
+  );
+  // every surface message contributes to the session estimate
+  assert.equal(
+    estimateSessionTokens(events),
+    surface.reduce((sum, m) => sum + estimateMessageTokens(m), 0),
+  );
+});
+
+test("selectKeepCount keeps only the newest turns under a budget", () => {
+  // two-turn synthetic rollout: turn 1 has a long user text, turn 2 is short
+  const mk = (id, ts, type, payload) => JSON.stringify({ timestamp: ts, type, payload });
+  const rollout = [
+    mk("m", "2026-08-01T00:00:00.000Z", "session_meta", { cwd: "/mnt/e/cell" }),
+    mk("m", "2026-08-01T00:00:01.000Z", "event_msg", { type: "task_started", turn_id: "t1" }),
+    mk("m", "2026-08-01T00:00:02.000Z", "event_msg", { type: "user_message", message: "x".repeat(4000) }),
+    mk("m", "2026-08-01T00:00:03.000Z", "event_msg", { type: "agent_message", message: "ok", phase: "commentary" }),
+    mk("m", "2026-08-01T00:00:04.000Z", "event_msg", { type: "task_complete", turn_id: "t1" }),
+    mk("m", "2026-08-01T00:00:05.000Z", "event_msg", { type: "task_started", turn_id: "t2" }),
+    mk("m", "2026-08-01T00:00:06.000Z", "event_msg", { type: "user_message", message: "hi" }),
+    mk("m", "2026-08-01T00:00:07.000Z", "event_msg", { type: "agent_message", message: "hello", phase: "commentary" }),
+    mk("m", "2026-08-01T00:00:08.000Z", "event_msg", { type: "task_complete", turn_id: "t2" }),
+  ].join("\n");
+  const { turns } = parseRollout(rollout);
+  const { events } = buildSession(turns, { sessionId: "session-2", cwd: "/mnt/e/cell" });
+  const tiny = selectKeepCount(events, 10);
+  assert.equal(tiny.keep, 1, "tiny budget keeps only the newest turn");
+  const huge = selectKeepCount(events, 1e9);
+  assert.equal(huge.keep, 2, "huge budget keeps everything");
+});
+
+test("buildSession with summary lands a compaction checkpoint before the kept turns", () => {
+  const { turns } = parseRollout(fixture);
+  const summary = [{ type: "text", text: "## Current Work\n- imported the codex session" }];
+  const { events } = buildSession(turns, {
+    sessionId: "session-cp",
+    cwd: "/mnt/e/cell",
+    maxTurns: 1,
+    summary,
+    compactionId: "cp-1",
+  });
+
+  const checkpoint = events.find((e) => e.type === "user/message" && e.data?.source?.plugin === "compact");
+  assert.ok(checkpoint, "expected a compaction checkpoint user message");
+  assert.equal(checkpoint.data.source.compactionId, "cp-1");
+  const blocks = checkpoint.data.content;
+  assert.equal(blocks[0].type, "text");
+  assert.ok(blocks[0].text.startsWith(CHECKPOINT_PREAMBLE));
+  assert.ok(blocks[0].text.includes(SUMMARY_OPEN_TAG));
+  assert.equal(blocks[blocks.length - 1].text, SUMMARY_CLOSE_TAG);
+
+  // the checkpoint is the FIRST model-visible node
+  const surface = surfaceMessages(events);
+  assert.equal(surface[0].source.plugin, "compact");
+
+  // the retained turn is wire-valid (declared == answered)
+  const wire = wireMessages(events);
+  const declared = wire
+    .filter((m) => m.role === "assistant")
+    .flatMap((m) => m.toolCalls.map((c) => c.id));
+  const toolIds = wire.filter((m) => m.role === "tool").map((m) => m.tool_call_id);
+  assert.deepEqual([...new Set(toolIds)], [...new Set(declared)]);
+});
+
+test("serializeWire expands tool-call blocks and tool-result blocks like the adapter", () => {
+  const { turns } = parseRollout(fixture);
+  const { events } = buildSession(turns, { sessionId: "session-w", cwd: "/mnt/e/cell" });
+  const wire = serializeWire(surfaceMessages(events));
+  // every tool message is declared by the nearest preceding assistant
+  let lastAssistantCalls = new Set();
+  for (const msg of wire) {
+    if (msg.role === "assistant") {
+      lastAssistantCalls = new Set((msg.tool_calls ?? []).map((c) => c.id));
+    } else if (msg.role === "tool") {
+      assert.ok(lastAssistantCalls.has(msg.tool_call_id), `tool ${msg.tool_call_id} must be declared`);
+    }
+  }
 });
